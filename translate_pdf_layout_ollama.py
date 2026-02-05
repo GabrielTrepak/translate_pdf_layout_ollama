@@ -1,12 +1,16 @@
 # translate_pdf_layout_ollama_v4.py
 # EN -> PT-BR (light novel) mantendo layout (bbox) do PDF, usando Ollama local
-# Melhorias v4:
+# v4 + fix de caracteres que viram "?" no PDF (ex.: reticências … -> ...)
+#
+# Principais features:
 # - Character Bible (CHAR_DB) com gênero + registro
 # - SPEAKER_STATE = personagem atual (persistente)
 # - Prompts com registro por personagem
 # - 2-pass: translate + polish
 # - Guardrails: evita "você" fora de aspas; corrige gênero 1ª pessoa; remove honoríficos inventados
-# - Layout: MIN_FONT_SIZE=8.0, lineheight (fallback), e truncamento com "…" se não couber
+# - Layout: MIN_FONT_SIZE=8.0, lineheight (fallback)
+# - Se não couber no mínimo: truncamento com "..." (não usa "…")
+# - Sanitização: normaliza caracteres para evitar glifos faltando (que viram "?")
 
 import os
 import re
@@ -25,7 +29,7 @@ import requests
 
 PDF_DIR = r"C:\Users\gtrep\Desktop\Python"
 PDF_IN = os.path.join(PDF_DIR, "Tsuki ga Michibiku Isekai Douchuu_01-1-9.pdf")
-PDF_OUT = os.path.join(PDF_DIR, "Tsuki_traduzido_layout_v4.pdf")
+PDF_OUT = os.path.join(PDF_DIR, "Tsuki_traduzido_layout_v4_fixed.pdf")
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5:7b"
@@ -34,8 +38,8 @@ CACHE_FILE = os.path.join(PDF_DIR, "translate_cache_en_pt.json")
 
 MAX_CHARS_PER_CALL = 1400
 
-# Layout
-MIN_FONT_SIZE = 10.0
+# Layout / legibilidade
+MIN_FONT_SIZE = 8.0
 FONT_STEP = 0.5
 LINEHEIGHT = 1.15  # se sua versão do PyMuPDF aceitar
 
@@ -48,40 +52,36 @@ TEXT_ALIGN = 0  # left
 # Character Bible
 # =========================
 
-# Observação: isso é um "default"; se o texto indicar o contrário, ajuste depois.
 CHAR_DB: Dict[str, Dict[str, str]] = {
-    # key interno -> dados
-    "makoto":   {"gender": "male",   "register": "informal_neutro"},
-    "tsukuyomi":{"gender": "male",   "register": "formal_moderado"},
-    "goddess":  {"gender": "female", "register": "formal_frio"},
-    "tomoe":    {"gender": "female", "register": "informal_brincalhona"},
-    "mio":      {"gender": "female", "register": "emocional_obsessiva"},
-    "shiki":    {"gender": "male",   "register": "formal_calmo"},
-    "tamaki":   {"gender": "female", "register": "neutro"},
-    "emma":     {"gender": "female", "register": "neutro"},
-    "lime":     {"gender": "male",   "register": "neutro"},
-    "root":     {"gender": "unknown","register": "neutro"},
-    "sofia":    {"gender": "female", "register": "neutro"},
-    "hibiki":   {"gender": "female", "register": "neutro"},
+    "makoto":    {"gender": "male",   "register": "informal_neutro"},
+    "tsukuyomi": {"gender": "male",   "register": "formal_moderado"},
+    "goddess":   {"gender": "female", "register": "formal_frio"},
+    "tomoe":     {"gender": "female", "register": "informal_brincalhona"},
+    "mio":       {"gender": "female", "register": "emocional_obsessiva"},
+    "shiki":     {"gender": "male",   "register": "formal_calmo"},
+    "tamaki":    {"gender": "female", "register": "neutro"},
+    "emma":      {"gender": "female", "register": "neutro"},
+    "lime":      {"gender": "male",   "register": "neutro"},
+    "root":      {"gender": "unknown","register": "neutro"},
+    "sofia":     {"gender": "female", "register": "neutro"},
+    "hibiki":    {"gender": "female", "register": "neutro"},
 }
 
-# nomes/aliases que podem aparecer no inglês (adicione conforme encontrar)
 NAME_ALIASES: Dict[str, List[str]] = {
-    "makoto":   ["makoto", "misumi", "misumi makoto"],
-    "tsukuyomi":["tsukuyomi"],
-    "goddess":  ["goddess", "the goddess"],
-    "tomoe":    ["tomoe", "shin"],
-    "mio":      ["mio"],
-    "shiki":    ["shiki", "lich"],
-    "tamaki":   ["tamaki"],
-    "emma":     ["emma"],
-    "lime":     ["lime", "lime latte"],
-    "root":     ["root"],
-    "sofia":    ["sofia", "sofia bulga"],
-    "hibiki":   ["hibiki", "hibiki otonashi"],
+    "makoto":    ["makoto", "misumi", "misumi makoto"],
+    "tsukuyomi": ["tsukuyomi"],
+    "goddess":   ["goddess", "the goddess"],
+    "tomoe":     ["tomoe", "shin"],
+    "mio":       ["mio"],
+    "shiki":     ["shiki", "lich"],
+    "tamaki":    ["tamaki"],
+    "emma":      ["emma"],
+    "lime":      ["lime", "lime latte"],
+    "root":      ["root"],
+    "sofia":     ["sofia", "sofia bulga"],
+    "hibiki":    ["hibiki", "hibiki otonashi"],
 }
 
-# Guia de estilo geral (fixo)
 STYLE_BIBLE = (
     "GUIA DE ESTILO (obrigatório):\n"
     "- Tom geral: PT-BR natural de light novel.\n"
@@ -91,12 +91,41 @@ STYLE_BIBLE = (
     "- Preserve pontuação e quebras de linha.\n"
 )
 
-# Memória curta
 CONTEXT_WINDOW = 3
 context_memory = deque(maxlen=CONTEXT_WINDOW)
 
-# Estado atual (quem domina o trecho)
-SPEAKER_STATE = "makoto"  # default: narrador
+# speaker atual persistente
+SPEAKER_STATE = "makoto"
+
+
+# =========================
+# TEXT SANITIZATION (evita "Fo?" etc.)
+# =========================
+
+def sanitize_pdf_text(s: str) -> str:
+    if not s:
+        return ""
+
+    # normaliza caracteres que frequentemente viram "?" por falta de glifo na fonte
+    s = (s
+         .replace("…", "...")
+         .replace("—", "-")
+         .replace("–", "-")
+         .replace("“", '"')
+         .replace("”", '"')
+         .replace("‘", "'")
+         .replace("’", "'")
+    )
+
+    # remove caracteres invisíveis/controle (mantém \n e \t)
+    s = "".join(
+        ch for ch in s
+        if ch == "\n" or ch == "\t" or (ord(ch) >= 32 and ord(ch) != 127)
+    )
+
+    # limpa espaços duplicados
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    return s.strip()
 
 
 # =========================
@@ -147,10 +176,6 @@ def ollama_generate(prompt: str, timeout_sec: int = 180) -> str:
 # =========================
 
 def detect_speaker(en_text: str) -> str:
-    """
-    Detecta o speaker dominante no trecho.
-    Se não detectar, mantém SPEAKER_STATE anterior (diálogo contínuo).
-    """
     global SPEAKER_STATE
     t = (en_text or "").lower()
 
@@ -171,7 +196,6 @@ def speaker_rules(speaker: str) -> str:
     gender = meta.get("gender", "unknown")
     register = meta.get("register", "neutro")
 
-    # regras específicas de narrador (Makoto)
     if speaker == "makoto":
         return (
             "- Speaker dominante: Makoto (narrador, homem).\n"
@@ -179,19 +203,18 @@ def speaker_rules(speaker: str) -> str:
             "- Não transformar 'eu' em 'você'.\n"
         )
 
-    # deuses
     if speaker == "tsukuyomi":
         return (
             "- Speaker dominante: Tsukuyomi (homem).\n"
             "- Diálogos dele: formal moderado, calmo; sem gíria.\n"
         )
+
     if speaker == "goddess":
         return (
             "- Speaker dominante: Deusa do mundo (mulher).\n"
             "- Diálogos dela: formal/frio; pode soar arrogante.\n"
         )
 
-    # genérico
     return (
         f"- Speaker dominante provável: {speaker}.\n"
         f"- Gênero: {gender}. Registro: {register}.\n"
@@ -309,8 +332,8 @@ def split_into_paragraphish_chunks(text: str, max_chars: int) -> List[str]:
     for para in paragraphs:
         if not para:
             continue
+
         if len(para) > max_chars:
-            # quebra por linhas
             sub = ""
             for ln in para.splitlines():
                 ln = ln.strip()
@@ -346,7 +369,7 @@ def translate_then_polish(en_text: str, cache: Dict[str, str]) -> str:
     if not t:
         return ""
 
-    k = key_for("V4|" + t)
+    k = key_for("V4FIX|" + t)
     if k in cache:
         return cache[k]
 
@@ -355,11 +378,9 @@ def translate_then_polish(en_text: str, cache: Dict[str, str]) -> str:
 
     context = "\n\n".join(context_memory)
 
-    # translate
     prompt = build_translate_prompt(t, context, speaker)
     draft = ollama_generate(prompt)
 
-    # retries
     if looks_like_second_person_leak(draft) or looks_like_wrong_gender_first_person(draft):
         retry = (
             prompt
@@ -375,14 +396,15 @@ def translate_then_polish(en_text: str, cache: Dict[str, str]) -> str:
 
     draft = strip_unjustified_honorifics(draft, t)
 
-    # polish
     polish_prompt = build_polish_prompt(t, draft, context, speaker)
     polished = ollama_generate(polish_prompt)
 
     out = polished.strip() if polished.strip() else draft.strip()
     out = strip_unjustified_honorifics(out, t)
 
-    # update memory only when chunk has no dialogue
+    # sanitiza caracteres problemáticos para fonte do PDF
+    out = sanitize_pdf_text(out)
+
     if out and (not has_quotes(t)):
         context_memory.append(out)
 
@@ -460,18 +482,15 @@ def collect_text_blocks(page: Any) -> List[Dict[str, Any]]:
 
 
 # =========================
-# PDF: writing (fit + truncation)
+# PDF: writing (fit + truncation) + sanitize
 # =========================
 
 def truncate_to_fit(page: Any, bbox: fitz.Rect, text: str, font: str, fontsize: float) -> str:
-    """
-    Trunca texto com "…" até caber (usando Shape insert_textbox rc).
-    """
-    s = (text or "").strip()
+    s = sanitize_pdf_text((text or "").strip())
     if not s:
         return s
 
-    # tentativa rápida: já cabe?
+    # teste rápido: já cabe?
     shape = page.new_shape()
     try:
         rc = shape.insert_textbox(
@@ -481,18 +500,20 @@ def truncate_to_fit(page: Any, bbox: fitz.Rect, text: str, font: str, fontsize: 
         rc = shape.insert_textbox(
             bbox, s, fontname=font, fontsize=fontsize, align=TEXT_ALIGN, color=TEXT_COLOR
         )
-    # descarta shape de teste
-    # (não damos commit)
     if isinstance(rc, (int, float)) and rc >= 0:
         return s
 
-    # trunca por caracteres (simples e eficaz)
-    # tenta manter pelo menos 30% do texto
+    # trunca sem cortar feio (corta até o último espaço)
     min_len = max(20, int(len(s) * 0.3))
     cur = s
+
     while len(cur) > min_len:
-        cur = cur[:-20].rstrip()
-        cur_try = cur + "…"
+        # corta um bloco e depois volta ao último espaço
+        cur = cur[:-30].rstrip()
+        if " " in cur:
+            cur = cur.rsplit(" ", 1)[0].rstrip()
+
+        cur_try = cur + "..."
         shape2 = page.new_shape()
         try:
             rc2 = shape2.insert_textbox(
@@ -502,23 +523,25 @@ def truncate_to_fit(page: Any, bbox: fitz.Rect, text: str, font: str, fontsize: 
             rc2 = shape2.insert_textbox(
                 bbox, cur_try, fontname=font, fontsize=fontsize, align=TEXT_ALIGN, color=TEXT_COLOR
             )
+
         if isinstance(rc2, (int, float)) and rc2 >= 0:
             return cur_try
 
-    # último recurso: primeira linha + …
     first_line = s.splitlines()[0].strip()
-    return (first_line[: max(20, min(len(first_line), 120))] + "…") if first_line else "…"
+    return (first_line[: max(20, min(len(first_line), 120))] + "...") if first_line else "..."
 
 
 def fit_textbox(page: Any, bbox: fitz.Rect, text: str, font: str, start_size: float) -> bool:
-    cur = float(start_size)
+    # clamp: se o original já era pequeno, não deixa ficar menor que o mínimo
+    cur = max(float(start_size), MIN_FONT_SIZE)
+    txt = sanitize_pdf_text(text)
 
     while cur >= MIN_FONT_SIZE:
         shape = page.new_shape()
         try:
             rc = shape.insert_textbox(
                 bbox,
-                text,
+                txt,
                 fontname=font,
                 fontsize=cur,
                 align=TEXT_ALIGN,
@@ -528,7 +551,7 @@ def fit_textbox(page: Any, bbox: fitz.Rect, text: str, font: str, start_size: fl
         except TypeError:
             rc = shape.insert_textbox(
                 bbox,
-                text,
+                txt,
                 fontname=font,
                 fontsize=cur,
                 align=TEXT_ALIGN,
@@ -542,8 +565,8 @@ def fit_textbox(page: Any, bbox: fitz.Rect, text: str, font: str, start_size: fl
         shape.commit()
         return True
 
-    # Não coube nem no mínimo: trunca em vez de encolher mais
-    fitted = truncate_to_fit(page, bbox, text, font, MIN_FONT_SIZE)
+    # Não coube: trunca em vez de encolher
+    fitted = truncate_to_fit(page, bbox, txt, font, MIN_FONT_SIZE)
     shape = page.new_shape()
     try:
         shape.insert_textbox(
@@ -581,7 +604,6 @@ def main() -> None:
         if not candidates:
             continue
 
-        # traduz primeiro
         translated_items: List[Tuple[fitz.Rect, str, str, float]] = []
         for c in candidates:
             tr = translate_block(c["text"], cache)
@@ -595,12 +617,10 @@ def main() -> None:
 
         translated_pages += 1
 
-        # redige só os bboxes que serão substituídos
         for bbox, _, _, _ in translated_items:
             page.add_redact_annot(bbox, fill=REDACTION_FILL)
         page.apply_redactions()
 
-        # escreve tradução
         for bbox, tr, font, size in translated_items:
             fit_textbox(page, bbox, tr, font, size)
             translated_blocks += 1
