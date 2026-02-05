@@ -39,7 +39,7 @@ CACHE_FILE = os.path.join(PDF_DIR, "translate_cache_en_pt.json")
 MAX_CHARS_PER_CALL = 1400
 
 # Layout / legibilidade
-MIN_FONT_SIZE = 8.0
+MIN_FONT_SIZE = 10.0
 FONT_STEP = 0.5
 LINEHEIGHT = 1.15  # se sua versão do PyMuPDF aceitar
 
@@ -635,10 +635,10 @@ def main() -> None:
     save_cache(cache)
 
     print("\nFINALIZADO")
-    print(f"Páginas com tradução: {translated_pages}")
+    print(f"Paginas com traducao: {translated_pages}")
     print(f"Blocos traduzidos: {translated_blocks}")
     print(f"Blocos pulados: {skipped_empty}")
-    print(f"Saída: {PDF_OUT}")
+    print(f"Saida: {PDF_OUT}")
     print(f"Cache: {CACHE_FILE}\n")
 
 
